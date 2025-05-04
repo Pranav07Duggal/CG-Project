@@ -1,5 +1,3 @@
-// Filename: main.cpp
-
 #include <GL/glew.h>
 #include <GL/glut.h>
 #include <vector>
@@ -7,15 +5,27 @@
 #include <cstdlib>
 #include <ctime>
 #include <cmath>
+
+#include <AL/al.h>
+#include <AL/alc.h>
+
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "tiny_obj_loader.h"
 
 #define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
+#include "stb_image.h" 
 
 const int WIDTH = 1280, HEIGHT = 720;
-const float STRIP_LENGTH = 60.0f;
-const float STRIP_WIDTH = 4.0f;
+const float STRIP_LENGTH = 40.0f;
+const float STRIP_WIDTH = 5.0f;
+
+struct SmokeParticle {
+    float x, y, z;
+    float lifetime;
+};
+
+std::vector<SmokeParticle> smokeParticles;
+
 
 enum State { IDLE, TAKEOFF_START, TAKEOFF_ASCEND, FLIGHT, TARGET_HIT, LANDING_PREP, LANDING, DONE };
 State state = IDLE;
@@ -25,6 +35,8 @@ float jetY = 0.0f;
 float jetZ = 0.0f;
 float jetAngle = 0.0f;
 float speed = 0.05f;
+float jetPitch = 0.0f; // NEW: Pitch angle for X-axis rotation
+
 
 float camX = jetX, camY = 2.0f, camZ = 15.0f;
 bool followJet = false;
@@ -37,10 +49,107 @@ float enemyX = 15.0f, enemyY = 10.0f;
 bool enemyAlive = false;
 bool wasdEnabled = false;
 
-bool keyW, keyA, keyS, keyD;
+bool keyW, keyA, keyS, keyD, keyQ, keyE;
 std::vector<float> vertices, normals, texcoords;
 std::vector<unsigned int> indices;
 GLuint textureColor;
+
+ALuint buffer, source;
+ALCdevice* device;
+ALCcontext* context;
+
+bool loadWavFile(const char* filename, std::vector<char>& bufferData, ALenum& format, ALsizei& freq) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file) return false;
+
+    char riff[4];
+    file.read(riff, 4); // "RIFF"
+    file.ignore(4);     // File size
+    char wave[4];
+    file.read(wave, 4); // "WAVE"
+    
+    char fmt[4];
+    file.read(fmt, 4); // "fmt "
+    uint32_t fmtLength;
+    file.read(reinterpret_cast<char*>(&fmtLength), 4);
+    
+    uint16_t audioFormat, numChannels;
+    uint32_t sampleRate, byteRate;
+    uint16_t blockAlign, bitsPerSample;
+
+    file.read(reinterpret_cast<char*>(&audioFormat), 2);
+    file.read(reinterpret_cast<char*>(&numChannels), 2);
+    file.read(reinterpret_cast<char*>(&sampleRate), 4);
+    file.read(reinterpret_cast<char*>(&byteRate), 4);
+    file.read(reinterpret_cast<char*>(&blockAlign), 2);
+    file.read(reinterpret_cast<char*>(&bitsPerSample), 2);
+
+    file.ignore(fmtLength - 16); // Skip any extra format bytes
+
+    // Search for "data" chunk
+    char dataHeader[4];
+    uint32_t dataSize;
+    while (true) {
+        file.read(dataHeader, 4);
+        file.read(reinterpret_cast<char*>(&dataSize), 4);
+        if (strncmp(dataHeader, "data", 4) == 0) break;
+        file.ignore(dataSize);
+    }
+
+    bufferData.resize(dataSize);
+    file.read(bufferData.data(), dataSize);
+
+    // Determine format
+    if (numChannels == 1) {
+        format = (bitsPerSample == 8) ? AL_FORMAT_MONO8 : AL_FORMAT_MONO16;
+    } else {
+        format = (bitsPerSample == 8) ? AL_FORMAT_STEREO8 : AL_FORMAT_STEREO16;
+    }
+    freq = sampleRate;
+    return true;
+}
+
+void initOpenAL() {
+    device = alcOpenDevice(nullptr);
+    if (!device) {
+        std::cerr << "Failed to open audio device." << std::endl;
+        return;
+    }
+
+    context = alcCreateContext(device, nullptr);
+    alcMakeContextCurrent(context);
+
+    alGenBuffers(1, &buffer);
+    alGenSources(1, &source);
+
+    std::vector<char> data;
+    ALenum format;
+    ALsizei freq;
+
+    if (!loadWavFile("explosion.wav", data, format, freq)) {
+        std::cerr << "Failed to load explosion.wav" << std::endl;
+        return;
+    }
+
+    alBufferData(buffer, format, data.data(), data.size(), freq);
+    alSourcei(source, AL_BUFFER, buffer);
+}
+
+void playExplosionSound() {
+    alSourcePlay(source);
+}
+void playDelayedExplosionSound(int value) {
+    playExplosionSound();
+}
+
+void cleanupOpenAL() {
+    alDeleteSources(1, &source);
+    alDeleteBuffers(1, &buffer);
+    alcMakeContextCurrent(nullptr);
+    alcDestroyContext(context);
+    alcCloseDevice(device);
+}
+
 
 bool loadModel(const std::string &path) {
     tinyobj::attrib_t attrib;
@@ -117,6 +226,91 @@ void drawGroundAndStrip(float yOffset = 0) {
     }
 }
 
+void drawSmokeTrail() {
+    glColor3f(0.7f, 0.7f, 0.7f);  // gray smoke
+    for (auto& s : smokeParticles) {
+        glPushMatrix();
+        glTranslatef(s.x, s.y, s.z);
+        glutSolidTorus(0.05, 0.15, 8, 12);  // small torus
+        glPopMatrix();
+    }
+}
+
+void draw3DMountains() {
+    srand(42);  // Fixed seed for consistent randomness
+
+    float baseSize = 10.0f;
+    int rows = 2;
+    int cols = 15;
+
+    float startX = -90.0f;
+    float startZ = -120.0f;  // Further back from airstrip
+
+    for (int row = 0; row < rows; row++) {
+        for (int i = 0; i < cols; i++) {
+            float baseX = startX + i * (baseSize + 2.0f);
+            float baseZ = startZ + row * (baseSize + 5.0f);
+
+            float height = 10.0f + rand() % 15; // 10 to 25
+
+            // Base corners
+            float x1 = baseX;
+            float z1 = baseZ;
+            float x2 = baseX + baseSize;
+            float z2 = baseZ;
+            float x3 = baseX + baseSize;
+            float z3 = baseZ + baseSize;
+            float x4 = baseX;
+            float z4 = baseZ + baseSize;
+
+            // Peak point
+            float peakX = baseX + baseSize / 2.0f;
+            float peakZ = baseZ + baseSize / 2.0f;
+            float peakY = height;
+
+            // Base color: dark green to brown
+            float r = 0.2f + (float)(rand() % 100) / 500.0f;
+            float g = 0.3f + (float)(rand() % 100) / 400.0f;
+            float b = 0.1f;
+
+            // Draw four triangular faces
+            glBegin(GL_TRIANGLES);
+
+            // Front face
+            glColor3f(r, g, b);
+            glVertex3f(x1, 0.0f, z1);
+            glVertex3f(x2, 0.0f, z2);
+            glColor3f(1.0f, 1.0f, 1.0f);
+            glVertex3f(peakX, peakY, peakZ);
+
+            // Right face
+            glColor3f(r, g, b);
+            glVertex3f(x2, 0.0f, z2);
+            glVertex3f(x3, 0.0f, z3);
+            glColor3f(1.0f, 1.0f, 1.0f);
+            glVertex3f(peakX, peakY, peakZ);
+
+            // Back face
+            glColor3f(r, g, b);
+            glVertex3f(x3, 0.0f, z3);
+            glVertex3f(x4, 0.0f, z4);
+            glColor3f(1.0f, 1.0f, 1.0f);
+            glVertex3f(peakX, peakY, peakZ);
+
+            // Left face
+            glColor3f(r, g, b);
+            glVertex3f(x4, 0.0f, z4);
+            glVertex3f(x1, 0.0f, z1);
+            glColor3f(1.0f, 1.0f, 1.0f);
+            glVertex3f(peakX, peakY, peakZ);
+
+            glEnd();
+        }
+    }
+}
+
+
+
 void updateCamera() {
     if (followJet) {
         camX = jetX;
@@ -143,6 +337,7 @@ void drawJet() {
     glTranslatef(jetX, jetY+1, jetZ);
     glRotatef(-90, 1, 0, 0);
     glRotatef(-jetAngle,0,1,0);
+    glRotatef(jetPitch, 1.0f, 0.0f, 0.0f);
     glScalef(0.5,0.5,0.5);
     glColor3f(0.7f, 0.7f, 1.0f);
     drawModel();
@@ -153,7 +348,7 @@ void drawEnemy() {
     if (!enemyAlive && state == FLIGHT) {
         enemyAlive = true;
         enemyX = jetX + 15;
-        enemyY = jetY + 10;
+        enemyY = jetY ;
     }
     if (enemyAlive) {
         glPushMatrix();
@@ -175,7 +370,9 @@ void display() {
     if (state == LANDING || state == DONE)
         drawGroundAndStrip(-1);  // second strip
 
+    draw3DMountains();
     drawJet();
+    drawSmokeTrail(); //new
     drawEnemy();
 
     if (missileFired) {
@@ -184,6 +381,7 @@ void display() {
             enemyAlive = false;
             missileFired = false;
             state = TARGET_HIT;
+
         }
         glColor3f(1, 0.5, 0);
         glPushMatrix();
@@ -208,32 +406,73 @@ void update(int) {
         case TAKEOFF_ASCEND:
             jetAngle += 1.5f;
             jetX += 0.1f;
-            jetY += 0.15f;
-            if (jetAngle >= 60) {
-                jetAngle -= 1.5f;
+            jetY += 0.25f;
+            if (jetAngle >= 50) {
                 jetAngle = 0;
                 followJet = true;
                 wasdEnabled = true;
+                jetX = -10;
                 state = FLIGHT;            
             }
             break;
 
         case LANDING_PREP:
-            jetY -= 0.05f;
-            if (jetY <= 0.1f) {
-                jetY = 0.1f;
-                state = DONE;
+            if (jetPitch > 0.1f) {
+            jetPitch -= 0.5f; // decrease pitch
+            if (jetPitch < 0.0f) jetPitch = 0.0f; // clamp
+             }
+             else if (jetPitch < -0.1f) {
+            jetPitch += 0.5f; // increase pitch
+            if (jetPitch > 0.0f) jetPitch = 0.0f; // clamp
             }
+            if (jetPitch == 0)
+            {
+                jetY -= 0.05f;
+                jetX += 0.10f;
+                if(jetAngle<=25) jetAngle += 0.5f;
+    
+                if (jetY <= 1.0f) {
+                    if(jetAngle>=0.0){
+                        jetAngle -= 2.5f;
+                    } else
+                    {
+                        jetAngle = 0;
+                        jetY = 0.1f;
+                        state = DONE;
+                    }
+
+                }   
+            }
+            break;
+
+            case FLIGHT:
+            jetX += 0.01f;
             break;
 
         default: break;
     }
 
+    if (keyD || missileFired) {
+        smokeParticles.push_back({ jetX, jetY + 1.0f, jetZ, 1.0f });
+    }
+    
+    // Update existing particles
+    for (auto it = smokeParticles.begin(); it != smokeParticles.end(); ) {
+        it->lifetime -= 0.02f;
+        it->y += 0.005f;  // slowly rise
+        if (it->lifetime <= 0)
+            it = smokeParticles.erase(it);
+        else
+            ++it;
+    }
+    
     if (wasdEnabled) {
         if (keyW) jetY += 0.1f;
         if (keyS) jetY -= 0.1f;
         if (keyA) jetX -= 0.1f;
         if (keyD) jetX += 0.1f;
+        if (keyQ) jetPitch +=0.5f;
+        if (keyE) jetPitch -=0.5f;
     }
 
     updateCamera();
@@ -249,10 +488,16 @@ void keyboardDown(unsigned char key, int, int) {
         case 'a': keyA = true; break;
         case 's': keyS = true; break;
         case 'd': keyD = true; break;
+        case 'q': keyQ = true; break;
+        case 'e': keyE = true; break;
         case ' ': if (state == FLIGHT && !missileFired) {
             missileFired = true;
             missileX = jetX;
             missileY = jetY + 1;
+            //  Explosion Sound
+           
+            glutTimerFunc(500, playDelayedExplosionSound, 0); 
+            
         } break;
     }
 }
@@ -262,6 +507,8 @@ void keyboardUp(unsigned char key, int, int) {
     if (key == 'a') keyA = false;
     if (key == 's') keyS = false;
     if (key == 'd') keyD = false;
+    if (key == 'q') keyQ = false;
+    if (key == 'e') keyE = false;
 }
 
 void reshape(int w, int h) {
@@ -279,13 +526,15 @@ int main(int argc, char** argv) {
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH);
     glutInitWindowSize(WIDTH, HEIGHT);
     glutCreateWindow("Jet Takeoff and Landing Simulation");
-
+    initOpenAL();
     glewInit();
     glEnable(GL_DEPTH_TEST);
     glClearColor(0.4f, 0.6f, 1.0f, 1.0f);
     loadModel("model/F-2.obj");
+    
     textureColor = loadTexture("model/textures/F-2_Color.png");
 
+    // loadModel("model/LowPolyTree.obj");
     glutDisplayFunc(display);
     glutReshapeFunc(reshape);
     glutKeyboardFunc(keyboardDown);

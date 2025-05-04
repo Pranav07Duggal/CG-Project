@@ -20,36 +20,37 @@ This project simulates a **3D fighter jet takeoff and landing** using **OpenGL**
 
 | Key | Action |
 |:----|:-------|
-| `T` | Trigger takeoff |
+| `T` | Trigger takeoff (automated) |
+| `L` | Trigger landing (automated) |
 | `W` | Move jet forward |
 | `A` | Move jet left |
 | `S` | Move jet backward |
-| `D` | Move jet right |
+| `D` | Move jet right / Emit smoke trail |
+| `Q` | Pitch jet upward |
+| `E` | Pitch jet downward |
 | `Space` | Shoot missile |
-| `L` | Trigger landing sequence |
 | `ESC` | Exit simulation |
 
 ---
-
 ## Requirements
 
 - g++ compiler
 - OpenGL libraries: GLEW, GL, GLU, GLUT
+- OpenAL for sound effects
 
 To install the necessary libraries on Ubuntu/Debian:
 
 ```bash
 sudo apt-get update
-sudo apt-get install build-essential freeglut3-dev libglew-dev libglm-dev
+sudo apt-get install build-essential freeglut3-dev libglew-dev libglm-dev libopenal-dev
 ```
 
 ---
 
-## How to Compile and Run
+## How to Compile and Run [Linux]
 
 ```bash
-g++ f2.c++ -o f2 -lGLEW -lGL -lGLU -lglut
-./f2
+g++ f2.c++ -o f2 -lGLEW -lGL -lGLU -lglut -lopenal -ldl ; ./f2
 ```
 
 ---
@@ -59,7 +60,7 @@ g++ f2.c++ -o f2 -lGLEW -lGL -lGLU -lglut
 | File/Folder | Description |
 |:------------|:------------|
 | `f2.c++` | Main source code file |
-| `models/` | (Optional) Folder for 3D jet models |
+| `model/` | (Optional) Folder for 3D jet models |
 | `textures/` | (Optional) Folder for texture images |
 
 ---
@@ -67,16 +68,15 @@ g++ f2.c++ -o f2 -lGLEW -lGL -lGLU -lglut
 ## Future Improvements
 
 - Add skybox and dynamic clouds
-- Add smoke trails during missile firing
-- Sound effects for engine and shooting
+- AI enabled Jets
 - Multiple enemy jets
 - Scoring system and HUD
 
 ---
 
-## Screenshots
+## Project Report
 
-*(Add screenshots of your simulation here!)*
+- Project Report PDF is avialable in this repository. 
 
 ---
 

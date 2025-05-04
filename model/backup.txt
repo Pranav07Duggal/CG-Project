@@ -1,0 +1,443 @@
+// Filename: main.cpp
+
+#include <GL/glew.h>
+#include <GL/glut.h>
+#include <vector>
+#include <iostream>
+#include <cstdlib>
+#include <ctime>
+#include <cmath>
+// new
+
+
+#define TINYOBJLOADER_IMPLEMENTATION
+#include "tiny_obj_loader.h"
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h" 
+
+const int WIDTH = 1280, HEIGHT = 720;
+const float STRIP_LENGTH = 40.0f;
+const float STRIP_WIDTH = 5.0f;
+
+struct SmokeParticle {
+    float x, y, z;
+    float lifetime;
+};
+
+std::vector<SmokeParticle> smokeParticles;
+
+
+enum State { IDLE, TAKEOFF_START, TAKEOFF_ASCEND, FLIGHT, TARGET_HIT, LANDING_PREP, LANDING, DONE };
+State state = IDLE;
+
+float jetX = -STRIP_LENGTH / 2.0f + 1.0f;
+float jetY = 0.0f;
+float jetZ = 0.0f;
+float jetAngle = 0.0f;
+float speed = 0.05f;
+float jetPitch = 0.0f; // NEW: Pitch angle for X-axis rotation
+
+
+float camX = jetX, camY = 2.0f, camZ = 15.0f;
+bool followJet = false;
+
+bool missileFired = false;
+float missileX, missileY;
+const float missileSpeed = 0.5f;
+
+float enemyX = 15.0f, enemyY = 10.0f;
+bool enemyAlive = false;
+bool wasdEnabled = false;
+
+bool keyW, keyA, keyS, keyD, keyQ, keyE;
+std::vector<float> vertices, normals, texcoords;
+std::vector<unsigned int> indices;
+GLuint textureColor;
+
+bool loadModel(const std::string &path) {
+    tinyobj::attrib_t attrib;
+    std::vector<tinyobj::shape_t> shapes;
+    std::vector<tinyobj::material_t> materials;
+    std::string warn, err;
+    if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, path.c_str())) {
+        std::cerr << err << std::endl; return false;
+    }
+    for (auto &shape: shapes) {
+        for (auto &idx: shape.mesh.indices) {
+            vertices.push_back(attrib.vertices[3*idx.vertex_index]);
+            vertices.push_back(attrib.vertices[3*idx.vertex_index+1]);
+            vertices.push_back(attrib.vertices[3*idx.vertex_index+2]);
+            if (!attrib.normals.empty()) {
+                normals.push_back(attrib.normals[3*idx.normal_index]);
+                normals.push_back(attrib.normals[3*idx.normal_index+1]);
+                normals.push_back(attrib.normals[3*idx.normal_index+2]);
+            }
+            if (!attrib.texcoords.empty()) {
+                texcoords.push_back(attrib.texcoords[2*idx.texcoord_index]);
+                texcoords.push_back(attrib.texcoords[2*idx.texcoord_index+1]);
+            }
+            indices.push_back(indices.size());
+        }
+    }
+    return true;
+}
+
+GLuint loadTexture(const char *file) {
+    int w,h,n;
+    unsigned char *data = stbi_load(file,&w,&h,&n,0);
+    if(!data){ std::cerr<<"Failed: "<<file<<std::endl; return 0; }
+    GLuint tex; glGenTextures(1,&tex); glBindTexture(GL_TEXTURE_2D,tex);
+    GLenum fmt=(n==4?GL_RGBA:GL_RGB);
+    glTexImage2D(GL_TEXTURE_2D,0,fmt,w,h,0,fmt,GL_UNSIGNED_BYTE,data);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+    stbi_image_free(data);
+    return tex;
+}
+
+void drawGroundAndStrip(float yOffset = 0) {
+    // Green ground
+    glColor3f(0.1f, 0.8f, 0.1f);  // Bright green
+    glBegin(GL_QUADS);
+    glVertex3f(-100, yOffset, -100);
+    glVertex3f(100, yOffset, -100);
+    glVertex3f(100, yOffset, 100);
+    glVertex3f(-100, yOffset, 100);
+    glEnd();
+
+    // Black airstrip
+    glColor3f(0, 0, 0);
+    glBegin(GL_QUADS);
+    glVertex3f(-STRIP_LENGTH / 2, yOffset + 0.01f, -STRIP_WIDTH / 2);
+    glVertex3f(STRIP_LENGTH / 2, yOffset + 0.01f, -STRIP_WIDTH / 2);
+    glVertex3f(STRIP_LENGTH / 2, yOffset + 0.01f, STRIP_WIDTH / 2);
+    glVertex3f(-STRIP_LENGTH / 2, yOffset + 0.01f, STRIP_WIDTH / 2);
+    glEnd();
+
+    // White stripes
+    glColor3f(1, 1, 1);
+    float stripeW = STRIP_LENGTH / 20;
+    for (int i = 0; i < 20; i += 2) {
+        float x0 = -STRIP_LENGTH / 2 + i * stripeW;
+        glBegin(GL_QUADS);
+        glVertex3f(x0, yOffset + 0.02f, -0.2f);
+        glVertex3f(x0 + stripeW, yOffset + 0.02f, -0.2f);
+        glVertex3f(x0 + stripeW, yOffset + 0.02f, 0.2f);
+        glVertex3f(x0, yOffset + 0.02f, 0.2f);
+        glEnd();
+    }
+}
+
+void drawSmokeTrail() {
+    glColor3f(0.7f, 0.7f, 0.7f);  // gray smoke
+    for (auto& s : smokeParticles) {
+        glPushMatrix();
+        glTranslatef(s.x, s.y, s.z);
+        glutSolidTorus(0.05, 0.15, 8, 12);  // small torus
+        glPopMatrix();
+    }
+}
+
+void draw3DMountains() {
+    srand(42);  // Fixed seed for consistent randomness
+
+    float baseSize = 10.0f;
+    int rows = 2;
+    int cols = 15;
+
+    float startX = -90.0f;
+    float startZ = -120.0f;  // Further back from airstrip
+
+    for (int row = 0; row < rows; row++) {
+        for (int i = 0; i < cols; i++) {
+            float baseX = startX + i * (baseSize + 2.0f);
+            float baseZ = startZ + row * (baseSize + 5.0f);
+
+            float height = 10.0f + rand() % 15; // 10 to 25
+
+            // Base corners
+            float x1 = baseX;
+            float z1 = baseZ;
+            float x2 = baseX + baseSize;
+            float z2 = baseZ;
+            float x3 = baseX + baseSize;
+            float z3 = baseZ + baseSize;
+            float x4 = baseX;
+            float z4 = baseZ + baseSize;
+
+            // Peak point
+            float peakX = baseX + baseSize / 2.0f;
+            float peakZ = baseZ + baseSize / 2.0f;
+            float peakY = height;
+
+            // Base color: dark green to brown
+            float r = 0.2f + (float)(rand() % 100) / 500.0f;
+            float g = 0.3f + (float)(rand() % 100) / 400.0f;
+            float b = 0.1f;
+
+            // Draw four triangular faces
+            glBegin(GL_TRIANGLES);
+
+            // Front face
+            glColor3f(r, g, b);
+            glVertex3f(x1, 0.0f, z1);
+            glVertex3f(x2, 0.0f, z2);
+            glColor3f(1.0f, 1.0f, 1.0f);
+            glVertex3f(peakX, peakY, peakZ);
+
+            // Right face
+            glColor3f(r, g, b);
+            glVertex3f(x2, 0.0f, z2);
+            glVertex3f(x3, 0.0f, z3);
+            glColor3f(1.0f, 1.0f, 1.0f);
+            glVertex3f(peakX, peakY, peakZ);
+
+            // Back face
+            glColor3f(r, g, b);
+            glVertex3f(x3, 0.0f, z3);
+            glVertex3f(x4, 0.0f, z4);
+            glColor3f(1.0f, 1.0f, 1.0f);
+            glVertex3f(peakX, peakY, peakZ);
+
+            // Left face
+            glColor3f(r, g, b);
+            glVertex3f(x4, 0.0f, z4);
+            glVertex3f(x1, 0.0f, z1);
+            glColor3f(1.0f, 1.0f, 1.0f);
+            glVertex3f(peakX, peakY, peakZ);
+
+            glEnd();
+        }
+    }
+}
+
+
+
+void updateCamera() {
+    if (followJet) {
+        camX = jetX;
+        camY = jetY + 2.0f;
+        camZ = jetZ + 15.0f;
+    }
+}
+void drawModel() {
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, textureColor);
+    glBegin(GL_TRIANGLES);
+    for(size_t i=0;i<indices.size();++i){
+      if(!texcoords.empty()) glTexCoord2f(texcoords[2*i],texcoords[2*i+1]);
+      if(!normals.empty())   glNormal3f(normals[3*i],normals[3*i+1],normals[3*i+2]);
+      glVertex3f(vertices[3*i],vertices[3*i+1],vertices[3*i+2]);
+    }
+    glEnd();
+    glDisable(GL_TEXTURE_2D);
+}
+
+
+void drawJet() {
+    glPushMatrix();
+    glTranslatef(jetX, jetY+1, jetZ);
+    glRotatef(-90, 1, 0, 0);
+    glRotatef(-jetAngle,0,1,0);
+    glRotatef(jetPitch, 1.0f, 0.0f, 0.0f);
+    glScalef(0.5,0.5,0.5);
+    glColor3f(0.7f, 0.7f, 1.0f);
+    drawModel();
+    glPopMatrix();
+}
+
+void drawEnemy() {
+    if (!enemyAlive && state == FLIGHT) {
+        enemyAlive = true;
+        enemyX = jetX + 15;
+        enemyY = jetY ;
+    }
+    if (enemyAlive) {
+        glPushMatrix();
+        glTranslatef(enemyX, enemyY, 0);
+        glColor3f(1, 0, 0);
+        glRotatef(-90, 1, 0, 0);
+        glScalef(0.5,0.5,0.5);
+        drawModel();
+        glPopMatrix();
+    }
+}
+
+void display() {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glLoadIdentity();
+    gluLookAt(camX, camY, camZ, jetX, jetY, jetZ, 0, 1, 0);
+
+    drawGroundAndStrip();  // main airstrip
+    if (state == LANDING || state == DONE)
+        drawGroundAndStrip(-1);  // second strip
+
+    draw3DMountains();
+    drawJet();
+    drawSmokeTrail(); //new
+    drawEnemy();
+
+    if (missileFired) {
+        missileX += missileSpeed;
+        if (missileX >= enemyX - 1) {
+            enemyAlive = false;
+            missileFired = false;
+            state = TARGET_HIT;
+        }
+        glColor3f(1, 0.5, 0);
+        glPushMatrix();
+        glTranslatef(missileX, missileY, 0);
+        glutSolidSphere(0.2, 10, 10);
+        glPopMatrix();
+    }
+
+    glutSwapBuffers();
+}
+
+void update(int) {
+    switch (state) {
+        case TAKEOFF_START:
+            jetX += speed;
+            speed += 0.0008f;
+            if (jetX >= STRIP_LENGTH / 2 - 5) {
+                state = TAKEOFF_ASCEND;
+            }
+            break;
+
+        case TAKEOFF_ASCEND:
+            jetAngle += 1.5f;
+            jetX += 0.1f;
+            jetY += 0.25f;
+            if (jetAngle >= 50) {
+                jetAngle = 0;
+                followJet = true;
+                wasdEnabled = true;
+                jetX = -10;
+                state = FLIGHT;            
+            }
+            break;
+
+        case LANDING_PREP:
+            if (jetPitch > 0.1f) {
+            jetPitch -= 0.5f; // decrease pitch
+            if (jetPitch < 0.0f) jetPitch = 0.0f; // clamp
+             }
+             else if (jetPitch < -0.1f) {
+            jetPitch += 0.5f; // increase pitch
+            if (jetPitch > 0.0f) jetPitch = 0.0f; // clamp
+            }
+            if (jetPitch == 0)
+            {
+                jetY -= 0.05f;
+                jetX += 0.10f;
+                if(jetAngle<=25) jetAngle += 0.5f;
+    
+                if (jetY <= 1.0f) {
+                    if(jetAngle>=0.0){
+                        jetAngle -= 2.5f;
+                    } else
+                    {
+                        jetAngle = 0;
+                        jetY = 0.1f;
+                        state = DONE;
+                    }
+
+                }   
+            }
+            break;
+
+            case FLIGHT:
+            jetX += 0.01f;
+            break;
+
+        default: break;
+    }
+
+    if (keyD || missileFired) {
+        smokeParticles.push_back({ jetX, jetY + 1.0f, jetZ, 1.0f });
+    }
+    
+    // Update existing particles
+    for (auto it = smokeParticles.begin(); it != smokeParticles.end(); ) {
+        it->lifetime -= 0.02f;
+        it->y += 0.005f;  // slowly rise
+        if (it->lifetime <= 0)
+            it = smokeParticles.erase(it);
+        else
+            ++it;
+    }
+    
+    if (wasdEnabled) {
+        if (keyW) jetY += 0.1f;
+        if (keyS) jetY -= 0.1f;
+        if (keyA) jetX -= 0.1f;
+        if (keyD) jetX += 0.1f;
+        if (keyQ) jetPitch +=0.5f;
+        if (keyE) jetPitch -=0.5f;
+    }
+
+    updateCamera();
+    glutPostRedisplay();
+    glutTimerFunc(16, update, 0);
+}
+
+void keyboardDown(unsigned char key, int, int) {
+    switch (key) {
+        case 't': if (state == IDLE) { state = TAKEOFF_START; speed = 0.05f; } break;
+        case 'l': if (state == TARGET_HIT) { state = LANDING_PREP; } break;
+        case 'w': keyW = true; break;
+        case 'a': keyA = true; break;
+        case 's': keyS = true; break;
+        case 'd': keyD = true; break;
+        case 'q': keyQ = true; break;
+        case 'e': keyE = true; break;
+        case ' ': if (state == FLIGHT && !missileFired) {
+            missileFired = true;
+            missileX = jetX;
+            missileY = jetY + 1;
+        } break;
+    }
+}
+
+void keyboardUp(unsigned char key, int, int) {
+    if (key == 'w') keyW = false;
+    if (key == 'a') keyA = false;
+    if (key == 's') keyS = false;
+    if (key == 'd') keyD = false;
+    if (key == 'q') keyQ = false;
+    if (key == 'e') keyE = false;
+}
+
+void reshape(int w, int h) {
+    if (h == 0) h = 1;
+    glViewport(0, 0, w, h);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluPerspective(45, (float)w / h, 0.1, 200);
+    glMatrixMode(GL_MODELVIEW);
+}
+
+int main(int argc, char** argv) {
+    srand(time(0));
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH);
+    glutInitWindowSize(WIDTH, HEIGHT);
+    glutCreateWindow("Jet Takeoff and Landing Simulation");
+
+    glewInit();
+    glEnable(GL_DEPTH_TEST);
+    glClearColor(0.4f, 0.6f, 1.0f, 1.0f);
+    loadModel("model/F-2.obj");
+    textureColor = loadTexture("model/textures/F-2_Color.png");
+
+    // loadModel("model/LowPolyTree.obj");
+    glutDisplayFunc(display);
+    glutReshapeFunc(reshape);
+    glutKeyboardFunc(keyboardDown);
+    glutKeyboardUpFunc(keyboardUp);
+    glutTimerFunc(16, update, 0);
+    glutMainLoop();
+    return 0;
+}
